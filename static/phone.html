@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>Motus Bridge</title>
+<style>
+  :root {
+    --bg: #0d0f12;
+    --fg: #e8eaed;
+    --dim: #6b7280;
+    --accent: #4ade80;
+    --warn: #f59e0b;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%;
+    background: var(--bg); color: var(--fg);
+    font: 15px/1.4 system-ui, -apple-system, sans-serif;
+    touch-action: none; user-select: none; -webkit-user-select: none;
+    overscroll-behavior: none;
+  }
+  body {
+    display: flex; flex-direction: column;
+    padding: env(safe-area-inset-top) 20px env(safe-area-inset-bottom);
+  }
+
+  header { padding: 14px 0 6px; display: flex; align-items: center; gap: 8px; }
+  #dot { width: 9px; height: 9px; border-radius: 50%; background: var(--dim); flex: none; }
+  #dot.on { background: var(--accent); }
+  #status { font-size: 13px; color: var(--dim); }
+
+  /* Area tarik — seluruh sisa layar */
+  #pad {
+    flex: 1; display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    border: 1px dashed #2a2f38; border-radius: 16px;
+    margin: 8px 0 12px; transition: border-color .12s, background .12s;
+  }
+  #pad.held { border-color: var(--accent); background: #4ade8010; }
+  #hint { color: var(--dim); font-size: 14px; text-align: center; padding: 0 24px; }
+
+  #drawTrack {
+    width: 78%; height: 16px; background: #1b1f26;
+    border-radius: 8px; margin-top: 22px; overflow: hidden;
+  }
+  #drawBar { height: 100%; width: 0; background: var(--accent); }
+  #drawPct { margin-top: 8px; font-variant-numeric: tabular-nums; color: var(--dim); font-size: 13px; }
+
+  .row { display: flex; gap: 10px; padding-bottom: 12px; }
+  button {
+    flex: 1; padding: 15px 0; font-size: 15px; font-weight: 500;
+    border: 1px solid #2a2f38; border-radius: 10px;
+    background: #171b21; color: var(--fg);
+  }
+  button:active { background: #232830; }
+  button.primary { border-color: var(--accent); color: var(--accent); }
+
+  #readout {
+    font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: var(--dim); padding-bottom: 14px;
+    font-variant-numeric: tabular-nums; white-space: pre;
+  }
+
+  #gate {
+    position: fixed; inset: 0; background: var(--bg);
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 18px; padding: 32px; text-align: center; z-index: 10;
+  }
+  #gate p { color: var(--dim); max-width: 300px; margin: 0; }
+  #gate button { flex: none; padding: 16px 40px; }
+</style>
+</head>
+<body>
+
+<div id="gate">
+  <h2 style="margin:0">Motus Bridge</h2>
+  <p>Butuh izin akses sensor gerak. Pegang HP seperti memegang busur, layar menghadap ke kamu.</p>
+  <button class="primary" id="startBtn">Mulai</button>
+  <p id="gateErr" style="color:var(--warn)"></p>
+</div>
+
+<header>
+  <div id="dot"></div>
+  <div id="status">belum terhubung</div>
+</header>
+
+<div id="pad">
+  <div id="hint">Tekan &amp; tahan untuk menarik<br>lepas untuk menembak</div>
+  <div id="drawTrack"><div id="drawBar"></div></div>
+  <div id="drawPct">0%</div>
+</div>
+
+<div class="row">
+  <button id="centerBtn" class="primary">Kalibrasi Tengah</button>
+  <button id="axisBtn">Sumbu: 0</button>
+</div>
+
+<div id="readout">menunggu sensor…</div>
+
+<script>
+"use strict";
+
+const DEG = Math.PI / 180;
+const DRAW_MS = 1200;          // waktu tahan penuh -> draw = 1.0
+
+let q     = [1, 0, 0, 0];      // orientasi absolut dari sensor
+let ref   = [1, 0, 0, 0];      // referensi kalibrasi
+let shot  = 0;
+let holding = false;
+let holdStart = 0;
+let ws = null;
+let gotSensor = false;
+let axisMode = 0;
+
+const $ = id => document.getElementById(id);
+
+/* ---------- quaternion ---------- */
+const qmul = (a, b) => [
+  a[0]*b[0] - a[1]*b[1] - a[2]*b[2] - a[3]*b[3],
+  a[0]*b[1] + a[1]*b[0] + a[2]*b[3] - a[3]*b[2],
+  a[0]*b[2] - a[1]*b[3] + a[2]*b[0] + a[3]*b[1],
+  a[0]*b[3] + a[1]*b[2] - a[2]*b[1] + a[3]*b[0],
+];
+const qconj = a => [a[0], -a[1], -a[2], -a[3]];
+
+/* Konversi alpha/beta/gamma (urutan intrinsik Z-X'-Y'') ke quaternion.
+   Ini formula referensi W3C — jangan diubah kecuali paham konsekuensinya. */
+function fromEuler(alpha, beta, gamma) {
+  const x = beta * DEG, y = gamma * DEG, z = alpha * DEG;
+  const cX = Math.cos(x/2), cY = Math.cos(y/2), cZ = Math.cos(z/2);
+  const sX = Math.sin(x/2), sY = Math.sin(y/2), sZ = Math.sin(z/2);
+  return [
+    cX*cY*cZ - sX*sY*sZ,
+    sX*cY*cZ - cX*sY*sZ,
+    cX*sY*cZ + sX*cY*sZ,
+    cX*cY*sZ + sX*sY*cZ,
+  ];
+}
+
+/* Preset penukaran sumbu. Tombol "Sumbu" memutar antar preset supaya
+   pencocokan orientasi HP <-> Unity bisa dilakukan tanpa recompile. */
+const AXIS_PRESETS = [
+  v => v,                                        // 0: apa adanya
+  v => [v[0],  v[1],  v[3], -v[2]],              // 1
+  v => [v[0], -v[2],  v[1],  v[3]],              // 2
+  v => [v[0],  v[3],  v[2], -v[1]],              // 3
+];
+
+/* ---------- sensor ---------- */
+function onOrient(e) {
+  if (e.alpha === null || e.alpha === undefined) return;
+  gotSensor = true;
+  q = fromEuler(e.alpha, e.beta, e.gamma);
+}
+
+/* ---------- tarik & lepas ---------- */
+const pad = $("pad");
+pad.addEventListener("pointerdown", e => {
+  e.preventDefault();
+  holding = true;
+  holdStart = performance.now();
+  pad.classList.add("held");
+});
+const release = () => {
+  if (!holding) return;
+  holding = false;
+  shot++;                                  // ID naik = event tembak
+  pad.classList.remove("held");
+  if (navigator.vibrate) navigator.vibrate(25);
+};
+pad.addEventListener("pointerup", release);
+pad.addEventListener("pointercancel", release);
+pad.addEventListener("pointerleave", release);
+
+/* Dipisah jadi fungsi karena GUI di PC bisa memicu keduanya dari jauh —
+   berguna saat kedua tangan sedang memegang HP/busur. */
+function center() {
+  ref = q.slice();
+  if (navigator.vibrate) navigator.vibrate([15, 40, 15]);
+}
+function setAxis(n) {
+  const len = AXIS_PRESETS.length;
+  axisMode = ((n % len) + len) % len;
+  $("axisBtn").textContent = "Sumbu: " + axisMode;
+}
+
+$("centerBtn").addEventListener("click", center);
+$("axisBtn").addEventListener("click", () => setAxis(axisMode + 1));
+
+/* ---------- koneksi ---------- */
+function connect() {
+  ws = new WebSocket(`wss://${location.host}/ws`);
+  ws.onopen  = () => { $("dot").classList.add("on"); $("status").textContent = "terhubung"; };
+  // Perintah dari GUI di PC. Relay hanya meneruskan cmd yang ada di whitelist-nya.
+  ws.onmessage = ev => {
+    let m;
+    try { m = JSON.parse(ev.data); } catch { return; }
+    if (m.cmd === "center") center();
+    else if (m.cmd === "axis" && Number.isInteger(m.value)) setAxis(m.value);
+  };
+  ws.onclose = () => {
+    $("dot").classList.remove("on");
+    $("status").textContent = "terputus — mencoba lagi…";
+    setTimeout(connect, 1500);             // auto-reconnect saat layar HP sempat mati
+  };
+  ws.onerror = () => ws.close();
+}
+
+/* ---------- loop kirim ---------- */
+function loop() {
+  const draw = holding
+    ? Math.min((performance.now() - holdStart) / DRAW_MS, 1)
+    : 0;
+
+  $("drawBar").style.width = (draw * 100) + "%";
+  $("drawPct").textContent = Math.round(draw * 100) + "%";
+
+  const rel = AXIS_PRESETS[axisMode](qmul(qconj(ref), q));
+
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ q: rel, draw: draw, shot: shot }));
+  }
+
+  $("readout").textContent = gotSensor
+    ? `q ${rel.map(v => (v >= 0 ? " " : "") + v.toFixed(3)).join(" ")}\nshot ${shot}   draw ${draw.toFixed(2)}`
+    : "sensor tidak mengirim data — cek izin / HTTPS";
+
+  requestAnimationFrame(loop);
+}
+
+/* ---------- start ---------- */
+$("startBtn").addEventListener("click", async () => {
+  try {
+    // iOS 13+ wajib minta izin dari gesture pengguna
+    if (typeof DeviceOrientationEvent.requestPermission === "function") {
+      const res = await DeviceOrientationEvent.requestPermission();
+      if (res !== "granted") { $("gateErr").textContent = "Izin ditolak."; return; }
+    }
+  } catch (err) {
+    $("gateErr").textContent = "Gagal minta izin: " + err.message;
+    return;
+  }
+
+  window.addEventListener("deviceorientation", onOrient);
+  connect();
+  loop();
+  $("gate").style.display = "none";
+
+  setTimeout(() => {
+    if (!gotSensor) $("status").textContent = "sensor diam — coba muat ulang";
+  }, 2500);
+});
+</script>
+</body>
+</html>

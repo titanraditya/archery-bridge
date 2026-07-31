@@ -1,0 +1,5 @@
+PySide6>=6.6        # GUI (app.py / app_ble.py); tidak dipakai kalau jalan headless
+aiohttp>=3.9        # versi HP  — server HTTPS + WebSocket
+cryptography>=42.0  # versi HP  — sertifikat self-signed
+qrcode>=7.4         # versi HP  — opsional, QR untuk membuka URL di HP
+bleak>=0.22         # versi BLE — tidak dipakai versi HP

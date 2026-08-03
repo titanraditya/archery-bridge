@@ -19,25 +19,43 @@ berdasarkan byte pertama.
 1. Biner, 12 byte little-endian `<4h H B B` — format yang dipakai firmware asli:
 
        qw,qx,qy,qz  int16   quaternion mentah x 32767 (ABSOLUT, belum dikalibrasi)
-       draw         uint16  0..65535 -> 0.0..1.0
-       flags        uint8   bit0 = anak panah terpasang (IR terhalang)
-       seq          uint8   nomor urut, wrap 0-255 — hanya untuk deteksi drop
+       meas         uint16  hasil IR gate: dt antar sensor dalam mikrodetik
+                            (atau m/s x100, lihat speed_unit). 0 = belum ada tembakan
+       shot_seq     uint8   dinaikkan firmware tiap anak panah selesai melewati
+                            KEDUA sensor ke arah depan. wrap 0-255
+       seq          uint8   nomor urut paket, wrap 0-255 — hanya untuk deteksi drop
+       btn_seq      uint8   OPSIONAL, byte ke-13. Dinaikkan tiap tombol Reset
+                            Posisi di busur ditekan. 12 byte saja tetap sah
 
-2. JSON satu baris — untuk firmware coba-coba yang belum tega pakai struct:
+2. JSON satu baris — untuk firmware coba-coba yang belum tega pakai struct.
+   Satu format, dua pilihan key untuk hasil IR gate; key lainnya sama:
 
-       {"q":[w,x,y,z], "draw":0.42, "nocked":true}
-       {"q":[w,x,y,z], "draw":0.42, "shot":7}     <- kalau firmware mau hitung sendiri
+       {"q":[w,x,y,z], "dt_us":1042, "shot_seq":7, "btn_seq":2}
+       {"q":[w,x,y,z], "speed":47.9, "shot":7,     "btn_seq":2}
 
-Firmware sengaja dibiarkan bodoh: cukup kirim orientasi mentah + keadaan IR.
-Tiga hal ini dikerjakan di sini, di dekat sumber data, persis seperti yang
-dilakukan phone.html di jalur HP:
+   Baris kedua untuk firmware yang menghitung m/s dan counter sendiri.
+   btn_seq opsional di dua-duanya.
 
-    * kalibrasi     q yang dikirim = ref^-1 x q_mentah
+Anak panah di simulator ini PATEN — dipasang tetap di wadahnya, tidak dilepas
+manual. Jadi tidak ada keadaan "terpasang / tidak"; yang diukur adalah penanda
+di batang panah yang melewati dua sensor IR berjarak tetap. Selisih waktunya
+memberi kecepatan lesatan, dan kecepatan itulah pengganti sensor tarikan.
+
+Deteksi tepinya HARUS di firmware, bukan di sini: pada ~50 m/s dengan jarak
+sensor 5 cm, Δt-nya cuma ~1 ms — mustahil terlihat oleh notify 60 Hz. Firmware
+cuma perlu mengunci Δt-nya lalu menaikkan shot_seq; sisanya tetap di Python:
+
+    * kalibrasi     q yang dikirim = ref^-1 x q_mentah. Titik nolnya bisa
+                    disetel dari tombol GUI maupun tombol fisik di busur —
+                    firmware cuma melapor "ditekan", bukan mengubah apa-apa
     * preset sumbu  AXIS_PRESETS, sama urutannya dengan phone.html
-    * rising-edge   shot++ saat IR kembali terang (anak panah meninggalkan busur)
+    * jarak gate    Δt -> m/s, jadi menggeser sensor tidak perlu flash ulang
+    * penyaringan   Δt di luar akal (mis. penanda lewat pelan saat menarik
+                    ulang) tidak dihitung sebagai tembakan
+    * normalisasi   m/s -> draw 0..1, supaya kontrak paket ke Unity tidak berubah
 
 Jadi tombol Kalibrasi Tengah dan preset 0-3 di GUI tetap bekerja tanpa perlu
-mem-flash ulang firmware, dan paket yang keluar identik dengan jalur HP.
+mem-flash ulang firmware, dan paket yang keluar tetap sebentuk dengan jalur HP.
 """
 
 import asyncio
@@ -59,6 +77,28 @@ RETRY_S = 2.0
 DROP_REPORT_S = 5.0
 
 PACKET = struct.Struct("<4hHBB")
+
+# Byte ke-13, opsional: pencacah tombol Reset Posisi di busur. Naik tiap ditekan,
+# bukan keadaan tertekan/tidak — alasannya sama dengan shot_seq, tekanan tombol
+# tidak boleh hilang gara-gara satu notify yang drop. Firmware yang cuma
+# mengirim 12 byte tetap jalan, cuma tombolnya yang tidak ada.
+BTN_OFFSET = PACKET.size
+
+# Jarak antar dua sensor IR, meter. Satu-satunya angka yang harus diukur ulang
+# kalau rig-nya digeser — sengaja di sini, bukan di firmware.
+GATE_DIST_M = 0.05
+
+# m/s yang masih masuk akal untuk lesatan panah. Di luar ini dianggap penanda
+# lewat karena sebab lain (busur ditarik ulang, tangan menghalangi sensor).
+SPEED_SANE = (2.0, 200.0)
+
+# m/s yang dipetakan ke draw 0.0..1.0. Setel setelah tahu rentang busur asli.
+SPEED_RANGE = (10.0, 50.0)
+
+# Lompatan shot_seq sebesar ini dianggap firmware yang menghitung ulang, bukan
+# tembakan beruntun — BLE putus 8 tembakan lamanya pasti sudah terlihat sebagai
+# disconnect duluan. Tanpa batas ini, satu byte korup jadi puluhan shot hantu.
+SHOT_SEQ_MAX_GAP = 8
 
 # Perintah yang boleh masuk. Whitelist, bukan pass-through.
 ALLOWED_CMDS = {"center", "axis", "scan", "connect", "disconnect"}
@@ -119,6 +159,9 @@ class BleReader:
         tx_uuid: str = NUS_TX,
         auto_connect: bool = True,
         rescan_s: float | None = None,
+        gate_dist_m: float = GATE_DIST_M,
+        speed_range: tuple[float, float] = SPEED_RANGE,
+        speed_unit: str = "dt_us",
     ) -> None:
         self.udp_dest = udp_dest
         self.address = address
@@ -130,20 +173,34 @@ class BleReader:
         # Mode headless tidak punya tombol, jadi ia memindai ulang sendiri.
         self.rescan_s = rescan_s
 
+        # "dt_us"      : field meas = mikrodetik antar sensor (firmware bodoh)
+        # "speed_x100" : field meas = m/s x 100 (firmware sudah menghitung sendiri)
+        self.gate_dist_m = gate_dist_m
+        self.speed_range = speed_range
+        self.speed_unit = speed_unit
+
         self._on_packet = on_packet or (lambda _: None)
         self._on_status = on_status or (lambda *a, **k: None)
 
         self.packets = 0
         self.dropped = 0
+        self.rejected = 0
+
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
         # keadaan olahan — semuanya hanya disentuh dari thread jaringan
         self.ref = (1.0, 0.0, 0.0, 0.0)
         self.axis = 0
         self.shot = 0
+        # Keduanya ditahan sampai tembakan berikutnya: dengan IR gate, kekuatan
+        # tembakan baru diketahui SESUDAH panah lepas, jadi tidak ada nilai
+        # real-time yang bisa ditampilkan selama menarik.
+        self.speed = 0.0
+        self.draw = 0.0
         self._raw_q = (1.0, 0.0, 0.0, 0.0)
-        self._nocked = False
         self._seq: int | None = None
+        self._shot_seq: int | None = None
+        self._btn_seq: int | None = None
         self._drop_note = 0.0
 
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -169,12 +226,16 @@ class BleReader:
     def _status(self, kind: str, **fields) -> None:
         self._on_status(kind, **fields)
 
+    def _center(self) -> None:
+        """Titik nol = orientasi busur saat ini. Sama seperti center() di
+        phone.html, hanya pindah dari HP ke sini. Dipakai dua-duanya: tombol
+        Kalibrasi Tengah di GUI dan tombol Reset Posisi di busur."""
+        self.ref = self._raw_q
+
     def _apply(self, cmd: dict) -> None:
         name = cmd.get("cmd")
         if name == "center":
-            # Titik nol = orientasi busur saat ini. Sama seperti center() di
-            # phone.html, hanya pindah dari HP ke sini.
-            self.ref = self._raw_q
+            self._center()
         elif name == "axis":
             try:
                 self.axis = int(cmd.get("value", 0)) % len(AXIS_PRESETS)
@@ -246,7 +307,12 @@ class BleReader:
         label = self.name or self.address
         self._status("info", text=f"menyambung ke {label}…")
         self._dropped_conn.clear()
+        # Semuanya pencacah milik firmware, dan firmware bisa saja baru boot
+        # ulang — selaraskan lagi dari paket pertama, jangan sampai terbaca
+        # sebagai tembakan atau tombol yang tidak pernah ditekan.
         self._seq = None
+        self._shot_seq = None
+        self._btn_seq = None
 
         try:
             async with BleakClient(
@@ -267,55 +333,97 @@ class BleReader:
 
     # ---- data ----------------------------------------------------------
 
+    def _speed(self, meas: int) -> float | None:
+        """Angka mentah IR gate -> m/s. 0 berarti belum ada tembakan tercatat."""
+        if meas <= 0:
+            return None
+        if self.speed_unit == "speed_x100":
+            return meas / 100.0
+        return self.gate_dist_m / (meas * 1e-6)
+
     def _parse(self, data: bytes):
-        """(q_mentah, draw, shot|None, nocked|None) atau None kalau tidak dikenali."""
+        """(q_mentah, speed|None, shot_seq|None, shot_absolut|None, btn_seq|None),
+        None kalau formatnya tidak dikenali."""
         if data[:1] == b"{":
             try:
                 m = json.loads(data.decode("utf-8"))
                 q = tuple(float(v) for v in m["q"])
                 if len(q) != 4:
                     return None
-                draw = float(m.get("draw", 0.0))
+                speed = m.get("speed")
+                speed = float(speed) if speed else self._speed(int(m.get("dt_us", 0)))
             except (ValueError, TypeError, KeyError, UnicodeDecodeError):
                 return None
-            shot = m.get("shot")
-            nocked = m.get("nocked", m.get("ir"))
-            return q, draw, int(shot) if shot is not None else None, \
-                bool(nocked) if nocked is not None else None
+            shot, shot_seq, btn = m.get("shot"), m.get("shot_seq"), m.get("btn_seq")
+            return q, speed, \
+                int(shot_seq) if shot_seq is not None else None, \
+                int(shot) if shot is not None else None, \
+                int(btn) if btn is not None else None
 
         if len(data) < PACKET.size:
             return None
-        qw, qx, qy, qz, draw, flags, seq = PACKET.unpack_from(data)
+        qw, qx, qy, qz, meas, shot_seq, seq = PACKET.unpack_from(data)
+        # Byte tombol boleh tidak ada — firmware tanpa tombol Reset Posisi
+        # mengirim 12 byte dan tetap sah.
+        btn = data[BTN_OFFSET] if len(data) > BTN_OFFSET else None
 
         if self._seq is not None and seq != (self._seq + 1) % 256:
             self.dropped += 1
         self._seq = seq
 
         q = tuple(v / 32767.0 for v in (qw, qx, qy, qz))
-        return q, draw / 65535.0, None, bool(flags & 1)
+        return q, self._speed(meas), shot_seq, None, btn
+
+    def _register(self, speed: float | None, count: int) -> None:
+        """Penanda di batang panah baru saja melewati kedua sensor IR."""
+        lo, hi = SPEED_SANE
+        if speed is None or not lo <= speed <= hi:
+            # Penanda lewat, tapi terlalu pelan atau terlalu cepat untuk sebuah
+            # lesatan — biasanya busur sedang ditarik ulang. Bukan tembakan.
+            self.rejected += 1
+            return
+        self.shot += count
+        self.speed = speed
+        v0, v1 = self.speed_range
+        self.draw = max(0.0, min(1.0, (speed - v0) / (v1 - v0))) if v1 > v0 else 0.0
 
     def _on_notify(self, _sender, data: bytearray) -> None:
         parsed = self._parse(bytes(data))
         if parsed is None:
             return
-        q_raw, draw, shot, nocked = parsed
+        q_raw, speed, shot_seq, shot_abs, btn_seq = parsed
 
         self._raw_q = qnorm(q_raw)
 
-        if shot is not None:
-            self.shot = shot
-        elif nocked is not None:
-            # IR kembali terang = anak panah meninggalkan busur. Deteksi tepinya
-            # di sini, bukan di konsumen, supaya tidak bergantung frame rate Unity.
-            if self._nocked and not nocked:
-                self.shot += 1
-            self._nocked = nocked
+        # Tombol Reset Posisi di busur. Harus sesudah _raw_q diperbarui, karena
+        # yang dijadikan titik nol adalah orientasi pada paket ini. Berapa pun
+        # kenaikannya dihitung satu kali — menekan dua kali cepat hasilnya sama
+        # saja, dan paket pertama cuma dipakai menyelaraskan.
+        if btn_seq is not None and btn_seq != self._btn_seq:
+            if self._btn_seq is not None:
+                self._center()
+                self._status("info", text="titik tengah direset dari tombol busur")
+            self._btn_seq = btn_seq
+
+        if shot_abs is not None:
+            self.shot = shot_abs
+            if speed is not None:
+                self._register(speed, 0)
+        elif shot_seq is not None and shot_seq != self._shot_seq:
+            # Paket pertama cuma dipakai untuk menyelaraskan, bukan dihitung —
+            # firmware boleh mulai dari angka berapa pun. Selisihnya diambil utuh
+            # supaya tembakan tidak hilang kalau ada notify yang drop.
+            if self._shot_seq is not None:
+                gap = (shot_seq - self._shot_seq) % 256
+                self._register(speed, gap if gap <= SHOT_SEQ_MAX_GAP else 1)
+            self._shot_seq = shot_seq
 
         rel = AXIS_PRESETS[self.axis](qmul(qconj(self.ref), self._raw_q))
         packet = {
             "q": [round(v, 5) for v in rel],
-            "draw": round(max(0.0, min(1.0, draw)), 4),
+            "draw": round(self.draw, 4),
             "shot": self.shot,
+            "speed": round(self.speed, 2),
         }
         self.sock.sendto(
             json.dumps(packet, separators=(",", ":")).encode("utf-8"), self.udp_dest
@@ -327,14 +435,21 @@ class BleReader:
 
     def _report_drops(self) -> None:
         """Paket BLE hilang itu wajar sesekali; yang perlu terlihat cuma kalau
-        jumlahnya naik terus (jarak, interferensi, connection interval)."""
-        if not self.dropped:
+        jumlahnya naik terus (jarak, interferensi, connection interval).
+        Lintasan yang ditolak juga dilaporkan di sini: kalau angkanya ikut naik
+        tiap menembak, berarti jarak gate atau SPEED_SANE yang salah setel."""
+        if not self.dropped and not self.rejected:
             return
         now = time.monotonic()
         if now - self._drop_note < DROP_REPORT_S:
             return
         self._drop_note = now
-        self._status("info", text=f"{self.dropped} paket BLE hilang", level="warn")
+        note = []
+        if self.dropped:
+            note.append(f"{self.dropped} paket BLE hilang")
+        if self.rejected:
+            note.append(f"{self.rejected} lintasan IR diabaikan (di luar SPEED_SANE)")
+        self._status("info", text=", ".join(note), level="warn")
 
     # ---- siklus hidup ---------------------------------------------------
 
@@ -403,11 +518,16 @@ def main() -> None:
 
     seen = 0
 
-    def on_packet(_: dict) -> None:
+    def on_packet(p: dict) -> None:
         nonlocal seen
         seen += 1
         if seen % 60 == 0:
-            print(f"\r    {seen} paket diteruskan", end="", flush=True)
+            print(
+                f"\r    {seen} paket diteruskan   "
+                f"shot {p['shot']}   {p['speed']:5.1f} m/s",
+                end="",
+                flush=True,
+            )
 
     reader = BleReader(
         on_packet=on_packet, on_status=on_status, address=address, rescan_s=10.0
@@ -418,6 +538,8 @@ def main() -> None:
     print("=" * 52)
     print(f"  Device     : {address or f'cari nama berawalan {NAME_PREFIX}'}")
     print(f"  UDP keluar : {UDP_DEST[0]}:{UDP_DEST[1]}")
+    print(f"  IR gate    : jarak {GATE_DIST_M * 100:.1f} cm, "
+          f"draw 0..1 dari {SPEED_RANGE[0]:.0f}–{SPEED_RANGE[1]:.0f} m/s")
     print()
     print("  Tanpa alamat, device yang namanya berawalan")
     print(f"  {NAME_PREFIX} disambung otomatis kalau cuma ada satu.")

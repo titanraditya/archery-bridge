@@ -315,6 +315,9 @@ class MainWindow(QMainWindow):
         self.q = (1.0, 0.0, 0.0, 0.0)
         self.draw = 0.0
         self.shot = 0
+        # Hanya diisi sumber yang mengukur kecepatan lesatan (jalur BLE, IR gate).
+        # None = sumbernya tidak punya, labelnya tetap seperti semula.
+        self.speed: float | None = None
         self.axis_sent: int | None = None
         self.connected = False
         self.last_packet = 0.0
@@ -537,6 +540,8 @@ class MainWindow(QMainWindow):
         try:
             self.draw = float(p.get("draw", 0.0))
             shot = int(p.get("shot", 0))
+            speed = p.get("speed")
+            self.speed = float(speed) if speed is not None else None
         except (TypeError, ValueError):
             return
 
@@ -606,7 +611,13 @@ class MainWindow(QMainWindow):
 
         self.drawBar.value = self.draw
         self.drawBar.update()
-        self.drawPct.setText(f"draw {round(self.draw * 100)}%")
+        pct = f"draw {round(self.draw * 100)}%"
+        if self.speed is not None:
+            # Sumbernya IR gate: angkanya kekuatan tembakan TERAKHIR, bukan
+            # posisi tarikan sekarang — jadi sebut kecepatannya biar tidak
+            # disangka bar-nya macet.
+            pct += f"   {self.speed:.1f} m/s"
+        self.drawPct.setText(pct)
 
         self.shotLabel.setText(f"shot {self.shot}")
         self.shotLabel.setStyleSheet(

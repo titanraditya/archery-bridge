@@ -30,18 +30,40 @@ segera datang.
 Konsekuensi langsung dari memilih UDP. Konsumen menyimpan `consumedShot` dan
 membandingkan; paket yang drop tidak menghilangkan event tembak.
 
-**Deteksi rising-edge terjadi di sisi Python/HP, bukan di konsumen.**
-Dilakukan di dekat sumber data agar tidak bergantung pada frame rate Unity.
-Di jalur BLE artinya `ble_reader.py` yang menghitung `shot` dari tepi turun
-sinyal IR — bukan firmware, bukan Unity.
+**Deteksi tembakan terjadi sedekat mungkin dengan sensor, bukan di konsumen.**
+Agar tidak bergantung pada frame rate Unity. Di jalur HP, `phone.html` yang
+mendeteksi tepi lepas. Di jalur BLE, pengukurannya terpaksa naik satu tingkat
+lagi ke firmware: dua IR gate dilewati dalam ~1 ms, sementara notify cuma 60 Hz
+(16 ms), jadi firmware yang mencatat Δt dan menaikkan `shot_seq`. `ble_reader.py`
+tetap yang memegang counter `shot` yang dikirim ke Unity, jarak gate, dan
+penyaringan lintasan yang bukan lesatan.
+
+**Kekuatan tembakan diukur dari kecepatan, bukan dari posisi tarikan.**
+Anak panah di rig ini paten — terpasang tetap, tidak dicabut-pasang — dan tidak
+ada potensiometer. Penanda di batangnya melewati dua sensor IR berjarak tetap;
+Δt-nya jadi m/s. Konsekuensi yang harus diingat: **tidak ada nilai apa pun
+selama menarik.** `draw` di paket adalah kekuatan tembakan *terakhir*, ditahan
+sampai tembakan berikutnya, bukan posisi tarikan sekarang. Bar tarikan di GUI
+karena itu terlihat diam di jalur BLE — itu benar, bukan bug.
 
 **Quaternion yang dikirim relatif terhadap titik kalibrasi** (`ref⁻¹ × q`).
 Heading absolut HP/IMU tidak sejajar dengan arah kamera Unity. Tanpa kalibrasi,
 crosshair akan menghadap arah acak setiap kali mulai.
 
-**Firmware busur dibiarkan bodoh.** Yang dikirim lewat BLE cuma quaternion
-mentah + keadaan IR + draw. Kalibrasi, preset sumbu, dan penghitungan `shot`
-dikerjakan `ble_reader.py`. Alasannya: tombol Kalibrasi Tengah dan preset 0–3
+**Titik kalibrasi bisa direset dari dua tempat, dikerjakan di satu tempat.**
+Busur punya tombol Reset Posisi fisik supaya penembak tidak perlu melepas
+pegangan atau minta tolong orang di depan PC. Tombolnya tidak mengubah arah
+komunikasi: firmware cuma menyelipkan pencacah `btn_seq` di paket yang memang
+sudah mengalir ke PC, dan `ble_reader._center()` yang mengerjakannya — sama
+persis dengan yang dipanggil tombol GUI. Dikirim sebagai pencacah, bukan
+keadaan tertekan/tidak, dengan alasan yang sama seperti `shot`.
+
+**Firmware busur dibiarkan sebodoh mungkin.** Yang dikirim lewat BLE cuma
+quaternion mentah + Δt antar IR gate + pencacah lesatan. Kalibrasi, preset
+sumbu, jarak gate, konversi ke m/s, dan counter `shot` dikerjakan
+`ble_reader.py`. Pengukuran Δt satu-satunya yang terpaksa di firmware karena
+alasan waktu di atas — dan yang dikirim tetap angka mentah, jadi menggeser
+posisi sensor cukup mengubah `GATE_DIST_M`. Alasannya: tombol Kalibrasi Tengah dan preset 0–3
 tetap bekerja tanpa perlu mem-flash ulang busur setiap kali penyetelan berubah,
 dan preset yang sudah dikonfirmasi di jalur HP berlaku apa adanya di jalur BLE
 (daftar `AXIS_PRESETS` sengaja dikembar di `phone.html` dan `ble_reader.py` —
@@ -80,23 +102,35 @@ bersamaan dengan GUI.
 Batas antar komponen. Mengubah ini berarti mengubah semua konsumen.
 
 ```json
-{ "q": [w, x, y, z], "draw": 0.0-1.0, "shot": int }
+{ "q": [w, x, y, z], "draw": 0.0-1.0, "shot": int, "speed": float }
 ```
 
 UTF-8 JSON satu baris, UDP ke `127.0.0.1:5005`, sekitar 60 paket/detik.
-Dua-duanya — jalur HP dan jalur BLE — mengirim ini apa adanya.
+
+Tiga field pertama dikirim dua-duanya, jalur HP dan jalur BLE. `speed` (m/s,
+hasil ukur IR gate) cuma ada di jalur BLE — konsumen wajib menganggapnya
+opsional. `draw` di jalur BLE adalah `speed` yang dinormalkan lewat
+`SPEED_RANGE`, jadi konsumen yang cuma paham `draw` tetap jalan tanpa diubah.
 
 ## Kontrak BLE (batas ke firmware)
+
+Jangan tertukar dengan Kontrak paket di atas: yang ini **masuk** ke
+`ble_reader.py` (mentah, dari sensor), yang di atas **keluar** darinya (sudah
+dikalibrasi dan dipetakan). Firmware tidak pernah mengirim bentuk yang di atas.
 
 Notify lewat Nordic UART Service; `6E400003-…` arah busur → PC. Dua format,
 dipilih parser dari byte pertama:
 
-- biner 12 byte `<4h H B B`: quaternion ×32767 (mentah, belum dikalibrasi),
-  draw uint16, flags (bit0 = IR terhalang / anak panah terpasang), seq
-- JSON `{"q":[…], "draw":…, "nocked":bool}` — untuk firmware coba-coba
+- biner 12 byte inti `<4h H B B`: quaternion ×32767 (mentah, belum dikalibrasi),
+  `meas` uint16 (Δt antar IR gate dalam µs, 0 = belum ada tembakan),
+  `shot_seq` uint8 (naik tiap lesatan lengkap belakang→depan), `seq`
+- byte ke-13 `btn_seq` opsional: pencacah tombol Reset Posisi di busur.
+  Paket 12 byte tetap sah — busur tanpa tombol tidak perlu diubah
+- JSON `{"q":[…], "dt_us":…, "shot_seq":…, "btn_seq":…}` — untuk firmware coba-coba
 
 `seq` hanya untuk menghitung paket hilang. Tidak ada arah PC → busur: perintah
-`center`/`axis` diselesaikan di `ble_reader.py`.
+`center`/`axis` diselesaikan di `ble_reader.py`, dan tombol fisik di busur pun
+cuma menumpang paket yang sudah mengalir ke PC.
 
 Versi lengkapnya untuk orang yang menulis firmware ada di `FIRMWARE.md` —
 kalau kontrak di `ble_reader.py` berubah, file itu ikut diperbarui.
@@ -109,7 +143,7 @@ kalau kontrak di `ble_reader.py` berubah, file itu ikut diperbarui.
 | `app.py` | Titik masuk versi HP: panel QR/URL + sertifikat + `Relay` |
 | `app_ble.py` | Titik masuk versi BLE: panel daftar device + `BleReader` |
 | `relay.py` | Kelas `Relay`: server HTTPS + WebSocket, meneruskan ke UDP. Tidak mengubah isi paket. Juga bisa jalan headless |
-| `ble_reader.py` | Kelas `BleReader`: notify BLE → paket kontrak → UDP. Kalibrasi, preset sumbu, dan rising-edge `shot` ada di sini. Juga bisa jalan headless |
+| `ble_reader.py` | Kelas `BleReader`: notify BLE → paket kontrak → UDP. Kalibrasi, preset sumbu, jarak gate (`GATE_DIST_M`), konversi Δt→m/s, dan counter `shot` ada di sini. Juga bisa jalan headless |
 | `static/phone.html` | Kontroler di HP: baca sensor, tarik-lepas, kalibrasi, preset sumbu |
 | `monitor.py` | Konsumen UDP untuk pengujian, pengganti Unity di fase ini |
 | `make_cert.py` | Sertifikat self-signed dengan IP LAN saat ini (khusus jalur HP) |
@@ -123,6 +157,12 @@ kalau kontrak di `ble_reader.py` berubah, file itu ikut diperbarui.
 Implementasi yang ada: `MouseBowInput`. Yang akan ditambah: `UdpBowInput`,
 membaca paket di thread latar, main thread mengambil nilai terakhir di bawah
 lock. `Arrow3D` dan `ArcheryGame3D` tidak perlu berubah.
+
+`GetDrawStrength()` di jalur BLE bernilai benar hanya *pada saat* `shot`
+bertambah — sebelum itu isinya kekuatan tembakan sebelumnya. Jadi baca
+`draw`/`speed` bersamaan dengan mendeteksi kenaikan `shot`, jangan dipakai untuk
+menganimasikan tarikan busur. Kalau nanti butuh balistik dengan satuan asli,
+`speed` (m/s) sudah tersedia di paket dan tidak perlu skala tebak-tebakan.
 
 Panah memakai pendekatan busur kinematik + raycast ke titik kena, bukan
 Rigidbody penuh — dipilih demi presisi skor dan kemudahan penyetelan.
@@ -141,9 +181,12 @@ Cube-test-nya ada di `ui.py` (`CubeView`) — kubus yang dirotasi langsung oleh
 kamera di scene.
 
 Jalur BLE belum pernah diuji dengan hardware betulan — yang sudah dibuktikan
-baru jalur datanya (parsing, kalibrasi, preset, rising-edge, reconnect) dengan
-bleak palsu. Yang perlu dicek saat busur siap: nama advertise berawalan `MOTUS`,
-connection interval cukup untuk ~60 Hz, dan skala draw dari sensor tarikan.
+baru jalur datanya (parsing, kalibrasi, preset, penghitungan shot, reconnect)
+dengan bleak palsu. Yang perlu dicek saat busur siap: nama advertise berawalan
+`MOTUS`, connection interval cukup untuk ~60 Hz, jarak sensor IR sebenarnya
+(`GATE_DIST_M`), dan rentang m/s terpelan–terkencang untuk mengisi
+`SPEED_RANGE`. Sampai keduanya diukur, angka `draw` dari jalur BLE cuma tebakan
+kasar; `speed` sudah benar begitu `GATE_DIST_M` betul.
 
 ## Menambah sumber ketiga
 

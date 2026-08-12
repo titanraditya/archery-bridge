@@ -64,10 +64,13 @@ sumbu, jarak gate, konversi ke m/s, dan counter `shot` dikerjakan
 `ble_reader.py`. Pengukuran Δt satu-satunya yang terpaksa di firmware karena
 alasan waktu di atas — dan yang dikirim tetap angka mentah, jadi menggeser
 posisi sensor cukup mengubah `GATE_DIST_M`. Alasannya: tombol Kalibrasi Tengah dan preset 0–3
-tetap bekerja tanpa perlu mem-flash ulang busur setiap kali penyetelan berubah,
-dan preset yang sudah dikonfirmasi di jalur HP berlaku apa adanya di jalur BLE
-(daftar `AXIS_PRESETS` sengaja dikembar di `phone.html` dan `ble_reader.py` —
-kalau salah satu diubah, ubah dua-duanya).
+tetap bekerja tanpa perlu mem-flash ulang busur setiap kali penyetelan berubah.
+
+Daftar `AXIS_PRESETS` dulu dikembar di `phone.html` dan `ble_reader.py`.
+Sekarang **tidak lagi**: IMU busur terpasang dengan sumbu tegak di Z, sedangkan
+preset jalur HP sudah dikonfirmasi benar apa adanya, jadi masing-masing daftar
+mengoreksi pemasangan sensornya sendiri dan nomor preset yang sama di GUI tidak
+berarti hal yang sama di dua jalur.
 
 **HTTPS wajib.** `DeviceOrientationEvent` hanya aktif di secure context.
 Sertifikat self-signed dengan SAN berisi IP — CN saja diabaikan browser modern.
@@ -106,6 +109,13 @@ Batas antar komponen. Mengubah ini berarti mengubah semua konsumen.
 ```
 
 UTF-8 JSON satu baris, UDP ke `127.0.0.1:5005`, sekitar 60 paket/detik.
+
+`q` memakai **konvensi tangan-kiri Unity**, bukan tangan-kanan seperti sensornya.
+Pencerminannya (`to_unity_handed()` / `toUnityHanded()`) dikerjakan di sisi
+sumber, sesudah preset sumbu, di kedua jalur — tanpa itu bidik ke kanan bikin
+panah melesat ke kiri. Ini beda dengan `AXIS_PRESETS` yang sengaja berbeda per
+jalur: pencerminan ini sebabnya konvensi Unity, bukan pemasangan sensor, jadi
+isinya wajib sama di `phone.html` dan `ble_reader.py`.
 
 Tiga field pertama dikirim dua-duanya, jalur HP dan jalur BLE. `speed` (m/s,
 hasil ukur IR gate) cuma ada di jalur BLE — konsumen wajib menganggapnya
@@ -169,16 +179,23 @@ Rigidbody penuh — dipilih demi presisi skor dan kemudahan penyetelan.
 
 ## Yang masih terbuka
 
-Mapping sumbu quaternion sumber → Unity belum ditentukan. Tombol **Sumbu** di
+Mapping sumbu quaternion sumber → Unity: jalur HP sudah dikonfirmasi, jalur BLE
+belum. Di jalur BLE, membidik kanan-kiri terbaca sebagai roll di sekitar arah
+bidik (kubus berputar, reticle diam) karena sumbu tegak IMU busur ada di Z —
+preset 1–3 di `ble_reader.py` semuanya memindahkan Z sumber ke Y, bedanya cuma
+arah putar yaw dan sumbu mana yang jadi arah moncong. Tombol **Sumbu** di
 `phone.html` memutar antar preset agar bisa dicoba tanpa recompile; tombol
 **0–3** di GUI mengirim preset tertentu ke sumber (lewat WebSocket di jalur HP,
 diterapkan lokal di jalur BLE), supaya preset bisa diganti tanpa melepas
 pegangan pada HP/busur.
 
 Cube-test-nya ada di `ui.py` (`CubeView`) — kubus yang dirotasi langsung oleh
-`q`. Preset yang benar tetap harus dikonfirmasi ulang di Unity, karena
-`CubeView` memakai konvensi tangan-kanan Y-atas dan bisa berbeda dari konvensi
-kamera di scene.
+`q`. `CubeView` memakai konvensi tangan-kanan Y-atas, sementara `q` di paket
+sekarang sudah tangan-kiri Unity. Akibatnya **kubus dan reticle di GUI kiri-
+kanannya tercermin** dibanding gerakan HP/busur yang sebenarnya. Itu benar, bukan
+bug: yang dicocokkan sekarang Unity, bukan kubus. Jangan mengganti preset sumbu
+untuk "memperbaiki" kubus — preset dipilih dengan melihat sumbu mana yang
+bergerak, bukan ke arah mana.
 
 Jalur BLE belum pernah diuji dengan hardware betulan — yang sudah dibuktikan
 baru jalur datanya (parsing, kalibrasi, preset, penghitungan shot, reconnect)

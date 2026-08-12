@@ -127,15 +127,51 @@ def qnorm(a):
     return (a[0] / n, a[1] / n, a[2] / n, a[3] / n)
 
 
-# Urutan dan isinya harus sama dengan AXIS_PRESETS di static/phone.html —
-# preset yang dikonfirmasi lewat cube test di jalur HP harus tetap berlaku
-# setelah pindah ke hardware.
+# Dulu daftar ini dikembar dengan AXIS_PRESETS di static/phone.html. Sejak
+# jalur HP presetnya sudah dikonfirmasi benar dan IMU busur ternyata terpasang
+# dengan orientasi lain, dua daftar ini sengaja dibiarkan berbeda: nomor preset
+# di GUI tidak lagi berarti sama di kedua jalur. Jangan menyamakan salah satu
+# ke yang lain "supaya rapi" — masing-masing mengoreksi pemasangan sensornya
+# sendiri.
+#
+# IMU di busur terpasang dengan sumbu putar tegaknya di Z, bukan Y: membidik
+# kanan-kiri terbaca sebagai roll di sekitar arah bidik, jadi kubus berputar
+# tapi reticle (arah -Z lokal) diam di tempat. Preset 1-3 semuanya memindahkan
+# sumbu-Z sumber ke sumbu-Y (atas) supaya kanan-kiri jadi yaw betulan; yang
+# membedakan cuma sisa kebebasannya — arah putar yaw, dan sumbu sumber mana
+# yang jadi arah moncong. Coba 1 dulu, lalu 2 kalau kanan-kirinya kebalik,
+# lalu 3 kalau reticle-nya menghadap ke samping saat busur lurus ke depan.
+#
+# Semua permutasi di bawah determinannya +1 (rotasi murni, bukan pencerminan).
+# Kalau nanti menambah preset, jaga syarat itu — permutasi bertanda salah
+# membalik arah putar dan bikin kalibrasi tengah kelihatan "hampir benar".
 AXIS_PRESETS = [
     lambda v: v,                                # 0: apa adanya
-    lambda v: (v[0],  v[1],  v[3], -v[2]),      # 1
-    lambda v: (v[0], -v[2],  v[1],  v[3]),      # 2
-    lambda v: (v[0],  v[3],  v[2], -v[1]),      # 3
+    lambda v: (v[0],  v[1],  v[3], -v[2]),      # 1: Z->Y (atas)
+    lambda v: (v[0],  v[1], -v[3],  v[2]),      # 2: Z->Y, yaw kebalik
+    lambda v: (v[0],  v[2],  v[3],  v[1]),      # 3: Z->Y, moncong pindah ke X
 ]
+
+
+def to_unity_handed(v):
+    """Tangan-kanan (sumber & CubeView) -> tangan-kiri (Unity).
+
+    Bukan penukaran sumbu, jadi tidak bisa dijadikan preset: semua preset di
+    atas determinannya +1, sedangkan ini pencerminan (determinan -1). Tanpa ini
+    bidik ke kanan bikin panah melesat ke kiri, dan gejalanya sama di jalur HP
+    maupun BLE karena penyebabnya konvensi Unity, bukan pemasangan sensor.
+
+    Yang dicerminkan sumbu kiri-kanan (X), jadi pitch tetap dan yang terbalik
+    yaw + roll — sesuai gejala yang diamati. Mencerminkan Z (rumus konversi
+    tangan-kanan yang lebih sering beredar) ikut membalik pitch, itu bukan yang
+    dibutuhkan di sini.
+
+    Konsekuensi yang harus diingat: kubus di GUI ikut tercermin karena GUI
+    mengintip paket yang sudah jadi. Kubus yang kiri-kanannya terasa terbalik
+    dibanding gerakan busur itu benar — jangan "diperbaiki" dengan mengganti
+    preset, karena yang dicocokkan sekarang adalah Unity.
+    """
+    return (v[0], v[1], -v[2], -v[3])
 
 
 # ------------------------------------------------------------------ reader
@@ -418,7 +454,9 @@ class BleReader:
                 self._register(speed, gap if gap <= SHOT_SEQ_MAX_GAP else 1)
             self._shot_seq = shot_seq
 
-        rel = AXIS_PRESETS[self.axis](qmul(qconj(self.ref), self._raw_q))
+        # Urutannya penting: preset dulu (mencocokkan pemasangan sensor), baru
+        # pencerminan (mencocokkan konvensi Unity). Dibalik hasilnya lain.
+        rel = to_unity_handed(AXIS_PRESETS[self.axis](qmul(qconj(self.ref), self._raw_q)))
         packet = {
             "q": [round(v, 5) for v in rel],
             "draw": round(self.draw, 4),

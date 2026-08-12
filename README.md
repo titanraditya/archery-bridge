@@ -113,7 +113,7 @@ Kontrak antara Python dan konsumen. JSON satu baris per paket, ~60/detik:
 
 | Field   | Tipe      | Arti |
 |---------|-----------|------|
-| `q`     | float[4]  | Orientasi **relatif terhadap titik kalibrasi**, urutan w,x,y,z |
+| `q`     | float[4]  | Orientasi **relatif terhadap titik kalibrasi**, urutan w,x,y,z, konvensi **tangan-kiri Unity** |
 | `draw`  | float 0–1 | Kekuatan tembakan |
 | `shot`  | int       | Counter tembakan, naik 1 tiap lepas |
 | `speed` | float m/s | Kecepatan lesatan terukur. **Hanya jalur BLE** — konsumen wajib menganggapnya opsional |

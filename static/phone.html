@@ -147,6 +147,15 @@ const AXIS_PRESETS = [
   v => [v[0],  v[3],  v[2], -v[1]],              // 3
 ];
 
+/* Tangan-kanan (sensor HP) -> tangan-kiri (Unity). Bukan penukaran sumbu, jadi
+   bukan preset: semua preset di atas determinannya +1, ini pencerminan (-1).
+   Tanpa ini bidik ke kanan bikin panah melesat ke kiri. Yang dicerminkan sumbu
+   kiri-kanan (X) sehingga pitch tetap dan yang terbalik yaw + roll.
+   Kembarannya to_unity_handed() di ble_reader.py — sebabnya sama-sama konvensi
+   Unity, bukan pemasangan sensor, jadi yang ini memang harus sama di dua jalur
+   (beda dengan AXIS_PRESETS yang sengaja dibiarkan berbeda). */
+const toUnityHanded = v => [v[0], v[1], -v[2], -v[3]];
+
 /* ---------- sensor ---------- */
 function onOrient(e) {
   if (e.alpha === null || e.alpha === undefined) return;
@@ -216,7 +225,8 @@ function loop() {
   $("drawBar").style.width = (draw * 100) + "%";
   $("drawPct").textContent = Math.round(draw * 100) + "%";
 
-  const rel = AXIS_PRESETS[axisMode](qmul(qconj(ref), q));
+  // Preset dulu (mencocokkan orientasi HP), baru pencerminan (konvensi Unity).
+  const rel = toUnityHanded(AXIS_PRESETS[axisMode](qmul(qconj(ref), q)));
 
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ q: rel, draw: draw, shot: shot }));
